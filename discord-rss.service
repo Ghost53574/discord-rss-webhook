@@ -1,0 +1,16 @@
+[Unit]
+Description=DiscordRss
+After=network.target network-online.target
+Requires=network-online.target
+
+[Service]
+Type=notify
+User=c0z
+Group=c0z
+ExecStart=/home/c0z/discord-rss-bot.sh
+ExecReload=/home/c0z/discord-rss-bot.sh
+TimeoutStopSec=5s
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
