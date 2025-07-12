@@ -30,21 +30,8 @@ function log_message() {
     esac
     
     local timestamp="$(date +'%D %T')"
-    echo -n -e "${color}[${level}] [${component}]\t[${timestamp}] ${message}${NC}\n"
+    echo -n -e "${color}[${level}]\t[${component}]\t\t[${timestamp}]\t${message}${NC}\n"
     echo "[${level}] [${component}] [${timestamp}] ${message}" >> "${DISCORD_LOG}"
-}
-
-# Legacy functions for backward compatibility
-function echo_info() {
-    log_message "INFO" "legacy" "$1"
-}
-
-function echo_warn() {
-    log_message "WARN" "legacy" "$1"
-}
-
-function echo_fail() {
-    log_message "ERROR" "legacy" "$1"
 }
 
 # Function to check for updates in all RSS feeds
@@ -60,7 +47,7 @@ function check_feeds {
     log_message "INFO" "check_feeds" "Starting feed check cycle"
     
     # Trap errors to prevent script termination
-    trap 'log_message "ERROR" "check_feeds" "Caught error during feed processing, continuing with next feed"' ERR
+    #trap 'log_message "ERROR" "check_feeds" "Caught error during feed processing, continuing with next feed"' ERR
     
     # Process each feed
     cd "${DISCORD_SHARE}/feeds" || {
@@ -72,6 +59,12 @@ function check_feeds {
         # Skip if not a file
         [[ ! -f "$FEED" ]] && continue
         
+        # Skip files that contain RSS data (safety check)
+        if grep -q "^Title:" "$FEED" 2>/dev/null; then
+            log_message "WARN" "check_feeds" "Skipping RSS cache file in feeds directory: ${FEED}"
+            continue
+        fi
+        
         total_feeds=$((total_feeds+1))
         
         # Reset variables for this feed
@@ -82,7 +75,7 @@ function check_feeds {
         source "${DISCORD_SHARE}/feeds/${FEED}"
         
         # Skip if missing required config
-        if [[ -z "$FEED_URL" || -z "$FEED_NAME" ]]; then
+        if [[ -z "${FEED_URL}" || -z "$FEED_NAME" ]]; then
             log_message "ERROR" "check_feeds" "Feed ${FEED} missing required configuration (FEED_URL or FEED_NAME)"
             failed_feeds=$((failed_feeds+1))
             continue
@@ -95,11 +88,10 @@ function check_feeds {
         if [[ -f "${DISCORD_CACHE}/${FEED_NAME}" ]]; then
             POST_LINK="$(grep -m1 '^Link:' "${DISCORD_CACHE}/${FEED_NAME}" | cut -f2- -d' ')"
         fi
-        
         # Get new feed content
         local feed_content
         feed_content="$(get_feed "${FEED_URL}")"
-        
+
         # Check if feed fetch failed
         if [[ "${feed_content}" == "FETCH_FAILED" ]]; then
             log_message "ERROR" "check_feeds" "Failed to fetch feed: ${BOT_USERNAME}"
@@ -115,8 +107,8 @@ function check_feeds {
             log_message "WARN" "check_feeds" "New post in ${BOT_USERNAME}"
             updated_feeds=$((updated_feeds+1))
             
-            # Save the new feed content
-            echo "${feed_content}" > "${DISCORD_CACHE}/${FEED_NAME}"
+            # Clean and save the new feed content (remove any log messages and ANSI codes)
+            echo "${feed_content}" | sed 's/\x1b\[[0-9;]*m//g' | grep -v '^\[INFO\]' | grep -v '^\[WARN\]' | grep -v '^\[ERROR\]' > "${DISCORD_CACHE}/${FEED_NAME}"
             
             # Post to all webhook URLs
             for webhook in $(echo "${WEBHOOK_URL}" | tr ',' '\n'); do
@@ -144,7 +136,7 @@ function check_feeds {
 
 # Use rsstail to get the latest feed with improved error handling and retries
 function get_feed {
-    local RSS_URL="$1"
+    local RSS_URL="${1}"
     local max_retries=3
     local retry_count=0
     local FEED_CONTENT=""
@@ -156,33 +148,69 @@ function get_feed {
         # Clear previous content
         FEED_CONTENT=""
         
-        # Call rsstail based on feed type
+        # Call rsstail based on feed type - capture only stdout, redirect stderr to /dev/null
         case "${FEED_NAME}" in
             # Reverse output for feeds that are weird and backwards
             openSUSE-Factory|openSUSE-Support|openSUSE-Bugs)
-                FEED_CONTENT="$(${RSSTAIL} -1pdlru "${RSS_URL}" -n 1 -b ${CHARACTER_LIMIT} 2>&1)"
+                FEED_CONTENT="$(${RSSTAIL} -1pdlru "${RSS_URL}" -n 1 -b ${CHARACTER_LIMIT})"
                 ;;
             *)
-                FEED_CONTENT="$(${RSSTAIL} -1pdlu "${RSS_URL}" -n 1 -b ${CHARACTER_LIMIT} 2>&1)"
+                FEED_CONTENT="$(${RSSTAIL} -1pdlu "${RSS_URL}" -n 1 -b ${CHARACTER_LIMIT})"
                 ;;
         esac
         
         local exit_code=$?
+
+        if [[ $exit_code -ne 0 ]]; then
+            log_message "ERROR" "get_feed" "Failed to fetch feed: ${RSS_URL} (exit code: ${exit_code})"
+            retry_count=$((retry_count+1))
+            if [[ $retry_count -lt $max_retries ]]; then
+                log_message "WARN" "get_feed" "Retrying (${retry_count}/${max_retries}) in 2 seconds..."
+                sleep 2
+            else
+                log_message "ERROR" "get_feed" "Max retries reached for ${RSS_URL}, giving up"
+                return 1
+            fi
+            continue
+        fi
         
-        # Check if we got valid content
-        if [[ $exit_code -eq 0 && -n "${FEED_CONTENT}" && ! "${FEED_CONTENT}" =~ "ERROR:" ]]; then
+        # Check if content is non-empty
+        if [[ -n "${FEED_CONTENT}" ]]; then
+            # Find the first non-empty line
+            local first_non_empty_line="$(echo "${FEED_CONTENT}" | grep -m1 -v '^[[:space:]]*$')"
+            if [[ "${first_non_empty_line}" =~ ^[[:space:]]*Title: ]]; then
+                log_message "INFO" "get_feed" "Successfully fetched feed content"
+            else
+                log_message "ERROR" "get_feed" "Fetched content does not match expected format (missing Title): ${first_non_empty_line}"
+                unset FEED_CONTENT
+                retry_count=$((retry_count+1))
+                if [[ $retry_count -lt $max_retries ]]; then
+                    log_message "WARN" "get_feed" "Retrying (${retry_count}/${max_retries}) in 2 seconds..."
+                    sleep 2
+                    continue
+                else
+                    log_message "ERROR" "get_feed" "Max retries reached for ${RSS_URL}, giving up"
+                    return 1
+                fi
+            fi
+        fi
+        
+        # Check if we got valid content (should start with Title: for RSS feeds)
+        # Make the regex more robust by allowing for potential whitespace
+        if [[ $exit_code -eq 0 && -n "${FEED_CONTENT}" && "${FEED_CONTENT}" =~ ^[[:space:]]*Title: ]]; then
+            log_message "INFO" "get_feed" "Successfully validated content format"
             # Success - return the content
             echo -e "${FEED_CONTENT}"
             return 0
         fi
         
-        # Log the failure
+        # Log the failure with more detail
         retry_count=$((retry_count+1))
         if [[ $retry_count -lt $max_retries ]]; then
-            log_message "WARN" "get_feed" "Retry ${retry_count}/${max_retries} for ${FEED_NAME}: ${RSS_URL} (exit code: ${exit_code})"
+            log_message "WARN" "get_feed" "Retry ${retry_count}/${max_retries} for ${FEED_NAME}: ${RSS_URL} (exit code: ${exit_code}, content empty: $([[ -z "${FEED_CONTENT}" ]] && echo "yes" || echo "no"), regex match: $([[ "${FEED_CONTENT}" =~ ^[[:space:]]*Title: ]] && echo "yes" || echo "no"))"
             sleep 2
         else
-            log_message "ERROR" "get_feed" "Failed after ${max_retries} attempts: ${FEED_NAME} (${RSS_URL})"
+            log_message "ERROR" "get_feed" "Failed after ${max_retries} attempts: ${FEED_NAME} (${RSS_URL}) - exit_code: ${exit_code}, content_length: ${#FEED_CONTENT}"
         fi
     done
     
@@ -192,14 +220,14 @@ function get_feed {
 }
 # Post feed to Discord using curl with improved error handling
 function post_feed {
-    local UPLOAD_URL="$1"
+    local UPLOAD_URL="${1}"
     
     log_message "INFO" "post_feed" "Processing feed ${FEED_NAME} for posting to Discord"
     
     # Extract feed data
     FEED_TITLE="$(grep -m1 '^Title:' "${DISCORD_CACHE}/${FEED_NAME}" | cut -f2- -d' ' | tr '"' "'" | cut -c-255)"
     FEED_LINK="$(grep -m1 '^Link:' "${DISCORD_CACHE}/${FEED_NAME}" | cut -f2- -d' ')"
-    FEED_DATE="$(grep -m1 '^Pub.date:' "${DISCORD_CACHE}/${FEED_NAME}" | cut -f2- -d' ')"
+    FEED_DATE="$(grep -m1 '^Pub.date:' "${DISCORD_CACHE}/${FEED_NAME}" | cut -f2- -d' ' | sed 's/\x1b\[[0-9;]*m//g')"
 
     # Use current date if no date found
     if [[ -z "$FEED_DATE" ]]; then
@@ -246,9 +274,12 @@ function post_feed {
             FEED_DESC="$(cat "${DISCORD_CACHE}/${FEED_NAME}" | grep -v '^Title:' | grep -v '^Link:' | grep -v '^Pub.date:' | sed "s%Description:%%" | pandoc --wrap=none -s -f html -t markdown | cut -f2- -d'(' | cut -f2- -d' ' | grep '^"' | cut -f2 -d'"')"
             ;;
         *)
-            FEED_DESC="$(cat "${DISCORD_CACHE}/${FEED_NAME}" | grep -v '^Title:' | grep -v '^Link:' | grep -v '^Pub.date:' | sed "s%Description:%%" | pandoc --wrap=none -s -f html -t markdown | grep -v '^<\!-' | tr -d '\\' | sed 's%{.*}%%g;s%!\[.*\](.*)%%g' | sed 's%^\[$%%g;s%^Watch video%\[Watch video%g' | grep . --color=never | sed 's%^.*%&\\n%g' | tr -d '\n' | tr '"' "'" | tr '\t' ' ' | tr -d '\r' | grep -v '^:::')"
+            FEED_DESC="$(cat "${DISCORD_CACHE}/${FEED_NAME}" | grep -v '^Title:' | grep -v '^Link:' | grep -v '^Pub.date:' | grep -v '^\[INFO\]' | grep -v '^\[WARN\]' | grep -v '^\[ERROR\]' | sed "s%Description:%%" | pandoc --wrap=none -s -f html -t markdown | grep -v '^<\!-' | tr -d '\\' | sed 's%{.*}%%g;s%!\[.*\](.*)%%g' | sed 's%^\[$%%g;s%^Watch video%\[Watch video%g' | grep . --color=never | sed 's%^.*%&\\n%g' | tr -d '\n' | tr '"' "'" | tr '\t' ' ' | tr -d '\r' | grep -v '^:::')"
             ;;
     esac
+
+    # Clean up any remaining log messages and unwanted patterns
+    FEED_DESC="$(echo "${FEED_DESC}" | sed '/^\[INFO\]/d; /^\[WARN\]/d; /^\[ERROR\]/d; /^$/d')"
     
     # Truncate long descriptions
     if [[ $(echo "${FEED_DESC}" | wc -c) -gt 1100 ]]; then
@@ -298,7 +329,7 @@ function post_feed {
         while [[ $retry_count -lt $max_retries && "$success" == false ]]; do
             # Send to Discord and capture response with status code
             local response
-            response=$(curl -s -w "\n%{http_code}" -H "Content-Type: application/json" -T "/tmp/discord-rss.json" "$UPLOAD_URL" 2>&1)
+            response=$(curl -s -w "\n%{http_code}" -H "Content-Type: application/json" -X POST -d @"/tmp/discord-rss.json" "${UPLOAD_URL}" 2>&1)
             
             # Extract HTTP code from last line
             local http_code=$(echo "$response" | tail -n1)
@@ -349,23 +380,35 @@ function post_feed {
     
     return 0
 }
+# JSON escape function to properly escape strings for JSON
+function json_escape() {
+    local input="$1"
+    # Escape backslashes first, then quotes, then newlines and carriage returns
+    printf '%s' "$input" | sed 's/\\/\\\\/g; s/"/\\"/g; s/$/\\n/g' | tr -d '\n' | sed 's/\\n$//'
+}
+
 # create json file containing embed data to upload to webhook URL
 function create_json {
-cat > /tmp/discord-rss.json << EOL
+    # Escape all dynamic content for JSON
+    local escaped_title="$(json_escape "${FEED_TITLE}")"
+    local escaped_desc="$(json_escape "${FEED_DESC}")"
+    local escaped_username="$(json_escape "${BOT_USERNAME}")"
+    
+    cat > /tmp/discord-rss.json << EOL
 {
     "username": "Rss Feed",
     "avatar_url": "${AVATAR_URL}",
     "embeds": [{
-        "title": "${FEED_TITLE}",
+        "title": "${escaped_title}",
         "url": "${FEED_LINK}",
-        "description": "${FEED_DESC}",
-        "color": "${FEED_COLOR}",
+        "description": "${escaped_desc}",
+        "color": ${FEED_COLOR},
         "timestamp": "$(date -d "${FEED_DATE}" '+%Y-%m-%dT%TZ' -u)",
         "${IMAGE_TYPE}": {
           "url": "${THUMBNAIL_URL}"
         },
         "author": {
-            "name": "${BOT_USERNAME}",
+            "name": "${escaped_username}",
             "url": "${FEED_LINK}",
             "icon_url": "${AVATAR_URL}"
         }
