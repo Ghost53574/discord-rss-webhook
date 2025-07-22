@@ -281,7 +281,7 @@ function post_feed {
     esac
 
     # Clean up any remaining log messages and unwanted patterns
-    FEED_DESC="$(echo "${FEED_DESC}" | sed '/^\[INFO\]/d; /^\[WARN\]/d; /^\[ERROR\]/d; /^$/d')"
+    FEED_DESC="$(echo "${FEED_DESC}" | sed '/^\[\ +INFO/d; /^\[\ +WARN/d; /^\[\ +ERROR\]; /^$/d')"
     
     # Truncate long descriptions
     if [[ $(echo "${FEED_DESC}" | wc -c) -gt 1100 ]]; then
@@ -390,7 +390,7 @@ function json_escape() {
 }
 
 # create json file containing embed data to upload to webhook URL
-function create_json {
+function create_json() {
     # Escape all dynamic content for JSON
     local escaped_title="$(json_escape "${FEED_TITLE}")"
     local escaped_desc="$(json_escape "${FEED_DESC}")"
@@ -420,8 +420,16 @@ EOL
 }
 # Setup environment for the bot with improved directory creation and initialization
 function setup_env {
+    if [[ ! -d "${DISCORD_LOGS}" ]]; then
+        mkdir -p "${DISCORD_LOGS}"
+        log_message "INFO" "setup_env" "Created logs directory: ${DISCORD_LOGS}"
+    fi
+    if [[ ! -f ${DISCORD_LOG} ]]; then
+        log_message "INFO" "setup_env" "Creating log file: ${DISCORD_LOG}"
+        touch "${DISCORD_LOG}"
+    fi
     # Create the main directory structure
-    for dir in "${DISCORD_FEEDS}" "${DISCORD_AVATARS}" "${DISCORD_LOGS}" "${DISCORD_CACHE}"; do
+    for dir in "${DISCORD_FEEDS}" "${DISCORD_AVATARS}" "${DISCORD_CACHE}"; do
         if [[ ! -d "$dir" ]]; then
             mkdir -p "$dir"
             log_message "INFO" "setup_env" "Created directory: $dir"
@@ -479,10 +487,10 @@ EOF
     fi
     
     # Copy any PNG files to the avatars directory if needed
-    if [[ -n "$(ls *.png 2>/dev/null)" ]]; then
-        log_message "INFO" "setup_env" "Copying PNG files to avatars directory"
-        cp -f *.png "${DISCORD_AVATARS}/" 2>/dev/null || true
-    fi
+    #if [[ -n "$(ls *.png 2>/dev/null)" ]]; then
+    #    log_message "INFO" "setup_env" "Copying PNG files to avatars directory"
+    #    cp -f *.png "${DISCORD_AVATARS}/" 2>/dev/null || true
+    #fi
     
     # Set up log rotation - keep only the most recent 30 logs
     if [[ $(ls -A "${DISCORD_LOGS}" 2>/dev/null | wc -l) -gt 30 ]]; then
