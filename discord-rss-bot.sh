@@ -6,14 +6,32 @@ YELLOW='\e[1;33m'
 RED='\e[0;31m'
 NC='\e[0m'
 
-DISCORD_CACHE="${HOME}/.cache/discord-rss"
-DISCORD_SHARE="${HOME}/.local/share/discord-rss-bot"
+DISCORD_CACHE="${PWD}/temp/.cache/discord-rss"
+DISCORD_SHARE="${PWD}/temp/.local/share/discord-rss-bot"
 DISCORD_FEEDS="${DISCORD_SHARE}/feeds"
 DISCORD_AVATARS="${DISCORD_SHARE}/avatars"
 DISCORD_LOGS="${DISCORD_SHARE}/logs"
 DISCORD_LOG="${DISCORD_LOGS}/${TIMESTAMP}.log"
 DISCORD_STATUS="${DISCORD_SHARE}/status.json"
 RSSTAIL="$(which rsstail)"
+
+# Helper function to center text within a given field width
+function center_text() {
+    local text="$1"
+    local width="$2"
+    local text_length=${#text}
+    
+    if [[ $text_length -ge $width ]]; then
+        echo "$text"
+        return
+    fi
+    
+    local total_padding=$((width - text_length))
+    local left_padding=$((total_padding / 2))
+    local right_padding=$((total_padding - left_padding))
+    
+    printf "%*s%s%*s" $left_padding "" "$text" $right_padding ""
+}
 
 # Unified logging function for consistent formatting
 function log_message() {
@@ -30,7 +48,8 @@ function log_message() {
     esac
     
     local timestamp="$(date +'%D %T')"
-    echo -n -e "${color}[${level}]\t[${component}]\t\t[${timestamp}]\t${message}${NC}\n"
+    local centered_component=$(center_text "$component" 15)
+    printf "${color}[%5s] [%s] [%s] %s${NC}\n" "$level" "$centered_component" "$timestamp" "$message"
     echo "[${level}] [${component}] [${timestamp}] ${message}" >> "${DISCORD_LOG}"
 }
 
@@ -140,6 +159,7 @@ function get_feed {
     local max_retries=3
     local retry_count=0
     local FEED_CONTENT=""
+    local timeout=15
     
     log_message "INFO" "get_feed" "Fetching feed from ${RSS_URL}"
     
@@ -148,69 +168,51 @@ function get_feed {
         # Clear previous content
         FEED_CONTENT=""
         
-        # Call rsstail based on feed type - capture only stdout, redirect stderr to /dev/null
+        # Use timeout command to prevent hanging
+        local rsstail_cmd=""
         case "${FEED_NAME}" in
             # Reverse output for feeds that are weird and backwards
             openSUSE-Factory|openSUSE-Support|openSUSE-Bugs)
-                FEED_CONTENT="$(${RSSTAIL} -1pdlru "${RSS_URL}" -n 1 -b ${CHARACTER_LIMIT})"
+                rsstail_cmd="timeout ${timeout} ${RSSTAIL} -1pdlru \"${RSS_URL}\" -n 1 -b ${CHARACTER_LIMIT}"
                 ;;
             *)
-                FEED_CONTENT="$(${RSSTAIL} -1pdlu "${RSS_URL}" -n 1 -b ${CHARACTER_LIMIT})"
+                rsstail_cmd="timeout ${timeout} ${RSSTAIL} -1pdlu \"${RSS_URL}\" -n 1 -b ${CHARACTER_LIMIT}"
                 ;;
         esac
         
+        # Execute with timeout and capture output
+        FEED_CONTENT="$(eval $rsstail_cmd 2>/dev/null)"
         local exit_code=$?
 
-        if [[ $exit_code -ne 0 ]]; then
+        # Handle timeout (exit code 124) and other errors
+        if [[ $exit_code -eq 124 ]]; then
+            log_message "ERROR" "get_feed" "Feed fetch timed out after ${timeout}s: ${RSS_URL}"
+        elif [[ $exit_code -ne 0 ]]; then
             log_message "ERROR" "get_feed" "Failed to fetch feed: ${RSS_URL} (exit code: ${exit_code})"
-            retry_count=$((retry_count+1))
-            if [[ $retry_count -lt $max_retries ]]; then
-                log_message "WARN" "get_feed" "Retrying (${retry_count}/${max_retries}) in 2 seconds..."
-                sleep 2
-            else
-                log_message "ERROR" "get_feed" "Max retries reached for ${RSS_URL}, giving up"
-                return 1
-            fi
-            continue
         fi
-        
-        # Check if content is non-empty
-        if [[ -n "${FEED_CONTENT}" ]]; then
+
+        # Check if we got valid content
+        if [[ $exit_code -eq 0 && -n "${FEED_CONTENT}" ]]; then
             # Find the first non-empty line
             local first_non_empty_line="$(echo "${FEED_CONTENT}" | grep -m1 -v '^[[:space:]]*$')"
             if [[ "${first_non_empty_line}" =~ ^[[:space:]]*Title: ]]; then
-                log_message "INFO" "get_feed" "Successfully fetched feed content"
+                log_message "INFO" "get_feed" "Successfully fetched and validated feed content"
+                echo -e "${FEED_CONTENT}"
+                return 0
             else
                 log_message "ERROR" "get_feed" "Fetched content does not match expected format (missing Title): ${first_non_empty_line}"
-                unset FEED_CONTENT
-                retry_count=$((retry_count+1))
-                if [[ $retry_count -lt $max_retries ]]; then
-                    log_message "WARN" "get_feed" "Retrying (${retry_count}/${max_retries}) in 2 seconds..."
-                    sleep 2
-                    continue
-                else
-                    log_message "ERROR" "get_feed" "Max retries reached for ${RSS_URL}, giving up"
-                    return 1
-                fi
             fi
         fi
         
-        # Check if we got valid content (should start with Title: for RSS feeds)
-        # Make the regex more robust by allowing for potential whitespace
-        if [[ $exit_code -eq 0 && -n "${FEED_CONTENT}" && "${FEED_CONTENT}" =~ ^[[:space:]]*Title: ]]; then
-            log_message "INFO" "get_feed" "Successfully validated content format"
-            # Success - return the content
-            echo -e "${FEED_CONTENT}"
-            return 0
-        fi
-        
-        # Log the failure with more detail
+        # Increment retry counter
         retry_count=$((retry_count+1))
+        
         if [[ $retry_count -lt $max_retries ]]; then
-            log_message "WARN" "get_feed" "Retry ${retry_count}/${max_retries} for ${FEED_NAME}: ${RSS_URL} (exit code: ${exit_code}, content empty: $([[ -z "${FEED_CONTENT}" ]] && echo "yes" || echo "no"), regex match: $([[ "${FEED_CONTENT}" =~ ^[[:space:]]*Title: ]] && echo "yes" || echo "no"))"
-            sleep 2
+            local wait_time=$((retry_count * 3))  # Progressive backoff: 3s, 6s, 9s
+            log_message "WARN" "get_feed" "Retry ${retry_count}/${max_retries} for ${FEED_NAME} in ${wait_time}s (exit code: ${exit_code}, content length: ${#FEED_CONTENT})"
+            sleep $wait_time
         else
-            log_message "ERROR" "get_feed" "Failed after ${max_retries} attempts: ${FEED_NAME} (${RSS_URL}) - exit_code: ${exit_code}, content_length: ${#FEED_CONTENT}"
+            log_message "ERROR" "get_feed" "Failed after ${max_retries} attempts: ${FEED_NAME} (${RSS_URL}) - final exit_code: ${exit_code}"
         fi
     done
     
